@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import urllib.request
 from datetime import datetime, timezone, timedelta
 
 import gspread
@@ -12,15 +13,13 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ============================================================
-# КОНФИГУРАЦИЯ — все значения берутся из переменных окружения
+# КОНФИГУРАЦИЯ
 # ============================================================
 API_ID = int(os.environ.get('TG_API_ID', '0'))
 API_HASH = os.environ.get('TG_API_HASH', '')
 SESSION_STRING = os.environ.get('TG_SESSION', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_BASE64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
-
-# Сколько минут назад смотреть сообщения (чуть больше интервала триггера)
 LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '35'))
 
 # ============================================================
@@ -61,31 +60,56 @@ def get_settings(ss):
         log.error(f'Ошибка чтения настроек: {e}')
         return False, []
 
-def get_allowed_chats(ss):
-    """Читает список чатов из листа Каналы."""
+def get_tg_settings(ss):
+    """Читает токен бота и chat_id из листа Настройки."""
+    try:
+        sheet = ss.worksheet('Настройки')
+        data = sheet.get_all_values()
+        token = str(data[1][1]).strip() if len(data) > 1 and len(data[1]) > 1 else ''
+        chats = []
+        for row in data[2:]:
+            if len(row) > 1 and str(row[1]).strip():
+                chats.append(str(row[1]).strip())
+        return token, chats
+    except Exception as e:
+        log.error(f'Ошибка чтения TG настроек: {e}')
+        return '', []
+
+def get_channels(ss):
+    """
+    Читает каналы из листа Каналы.
+    Возвращает список словарей: {username, last_link, row_index}
+    Колонка A — канал, B — последний пост, C — статус
+    """
     try:
         sheet = ss.worksheet('Каналы')
         data = sheet.get_all_values()
-        chats = []
-        for row in data[1:]:
-            if row and row[0].strip():
-                username = extract_username(row[0].strip())
-                if username:
-                    chats.append(username)
-        return chats
+        channels = []
+        for i, row in enumerate(data[1:], start=2):
+            if not row or not row[0].strip():
+                continue
+            raw = row[0].strip()
+            username = extract_username(raw)
+            if not username:
+                continue
+            last_link = row[1].strip() if len(row) > 1 else ''
+            channels.append({
+                'username': username,
+                'last_link': last_link,
+                'row': i
+            })
+        return channels
     except Exception as e:
         log.error(f'Ошибка чтения каналов: {e}')
         return []
 
-def get_existing_links(ss):
-    """Возвращает set уже записанных ссылок для дедупликации."""
+def update_channel(ss, row, last_link, status):
+    """Обновляет LastLink (col B) и Статус (col C) одним запросом."""
     try:
-        sheet = ss.worksheet('Посты')
-        data = sheet.get_all_values()
-        return set(row[2] for row in data[1:] if len(row) > 2 and row[2])
+        sheet = ss.worksheet('Каналы')
+        sheet.update(f'B{row}:C{row}', [[last_link, status]])
     except Exception as e:
-        log.error(f'Ошибка чтения постов: {e}')
-        return set()
+        log.error(f'Ошибка обновления канала row={row}: {e}')
 
 def write_posts(ss, posts):
     """Пакетная запись постов в лист Посты."""
@@ -105,7 +129,7 @@ def write_posts(ss, posts):
         log.error(f'Ошибка записи постов: {e}')
 
 def write_log(ss, level, message):
-    """Пишет в лист Логи."""
+    """Пишет строку в лист Логи."""
     try:
         sheet = ss.worksheet('Логи')
         safe = str(message)
@@ -117,6 +141,35 @@ def write_log(ss, level, message):
         )
     except Exception as e:
         log.error(f'Ошибка записи лога: {e}')
+
+# ============================================================
+# TELEGRAM ОТПРАВКА
+# ============================================================
+def send_to_telegram(posts, tg_token, tg_chats):
+    """Отправляет посты в Telegram чаты/каналы через бота."""
+    if not posts or not tg_token or not tg_chats:
+        return
+    for p in posts:
+        text = f"📢 *{p['chat_name']}*\n\n{p['text']}\n\n🔗 {p['link']}"
+        if len(text) > 4000:
+            text = text[:4000] + '...'
+        for chat_id in tg_chats:
+            try:
+                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                data = json.dumps({
+                    'chat_id': chat_id,
+                    'text': text,
+                    'parse_mode': 'Markdown',
+                    'disable_web_page_preview': False
+                }).encode('utf-8')
+                req = urllib.request.Request(
+                    url, data=data,
+                    headers={'Content-Type': 'application/json'}
+                )
+                urllib.request.urlopen(req, timeout=10)
+                import time; time.sleep(0.3)
+            except Exception as e:
+                log.error(f'Ошибка отправки TG в {chat_id}: {e}')
 
 # ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -134,6 +187,10 @@ def extract_username(raw):
     if re.match(r'^-?\d+$', raw):
         return raw
     return None
+
+def extract_post_id(link):
+    m = re.search(r'/(\d+)$', link)
+    return int(m.group(1)) if m else 0
 
 def build_link(chat, msg_id):
     username = getattr(chat, 'username', None)
@@ -182,42 +239,59 @@ async def main():
 
     # Настройки
     keywords_enabled, keywords = get_settings(ss)
-    allowed_chats = get_allowed_chats(ss)
-    existing_links = get_existing_links(ss)
+    tg_token, tg_chats = get_tg_settings(ss)
+    channels = get_channels(ss)
 
-    log.info(f'Чатов для парсинга: {len(allowed_chats)}')
-    log.info(f'Ключевые слова: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}')
+    log.info(f'Чатов: {len(channels)} | Ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}')
 
-    if not allowed_chats:
-        log.warning('Нет чатов в листе Каналы')
-        write_log(ss, 'WARN', 'Нет чатов в листе Каналы')
+    if not channels:
+        log.warning('Нет каналов в листе Каналы')
+        write_log(ss, 'WARN', 'Нет каналов в листе Каналы')
         return
 
-    # Telegram
+    # Telegram клиент
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
     log.info('Telegram подключён')
 
-    since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
     all_new_posts = []
-    total_checked = 0
     total_new = 0
     total_saved = 0
 
-    for chat_username in allowed_chats:
-        try:
-            # Получаем сообщения за последние LOOKBACK_MINUTES минут
-            messages = []
-            async for msg in client.iter_messages(chat_username, limit=50):
-                if msg.date < since:
-                    break
-                messages.append(msg)
+    write_log(ss, 'INFO', f'ПРОГОН НАЧАТ | чатов: {len(channels)} | ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}')
 
+    for ch in channels:
+        chat_username = ch['username']
+        last_link = ch['last_link']
+        last_post_id = extract_post_id(last_link) if last_link else 0
+        row = ch['row']
+
+        try:
             chat = await client.get_entity(chat_username)
             chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
 
-            new_msgs = []
+            # Собираем новые сообщения по id > last_post_id
+            # Дополнительно ограничиваем по времени если last_post_id == 0
+            since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
+            messages = []
+
+            async for msg in client.iter_messages(chat_username, limit=100):
+                # Если есть last_post_id — берём всё новее него
+                if last_post_id > 0:
+                    if msg.id <= last_post_id:
+                        break
+                else:
+                    # Первый запуск — берём за последние LOOKBACK_MINUTES минут
+                    if msg.date < since:
+                        break
+                messages.append(msg)
+
+            # Сортируем от старых к новым
+            messages.sort(key=lambda m: m.id)
+
+            new_msgs_count = len(messages)
             saved_msgs = []
+            new_last_link = last_link  # по умолчанию не меняем
 
             for msg in messages:
                 text = msg.text or msg.message or ''
@@ -225,44 +299,51 @@ async def main():
                     text = msg.caption
 
                 link = build_link(chat, msg.id)
+                date = msg.date.replace(tzinfo=None)
 
-                # Пропускаем уже записанные
-                if link in existing_links:
-                    continue
+                # Обновляем last_link по каждому новому посту
+                new_last_link = link
 
-                new_msgs.append(msg)
-
-                # Фильтр ключевых слов (только для постов с текстом)
+                # Фильтр ключевых слов только для постов с текстом
                 if keywords_enabled and keywords and text.strip():
                     if not matches_keywords(text, keywords):
                         continue
 
-                date = msg.date.replace(tzinfo=None)
                 saved_msgs.append({
                     'date': date,
                     'chat_name': chat_name,
                     'link': link,
                     'text': text
                 })
-                existing_links.add(link)
 
-            total_checked += len(messages)
-            total_new += len(new_msgs)
+            total_new += new_msgs_count
             total_saved += len(saved_msgs)
             all_new_posts.extend(saved_msgs)
 
-            log.info(f'{chat_username} | за {LOOKBACK_MINUTES} мин: {len(messages)} | новых: {len(new_msgs)} | в таблицу: {len(saved_msgs)}')
+            # Обновляем LastLink и Статус в листе Каналы
+            if new_msgs_count > 0:
+                update_channel(ss, row, new_last_link, f'✅ Новых: {new_msgs_count} | Записано: {len(saved_msgs)}')
+            else:
+                update_channel(ss, row, last_link, '✅ Нет новых сообщений')
+
+            log.info(f'{chat_username} | новых: {new_msgs_count} | в таблицу: {len(saved_msgs)} | lastId: {last_post_id or "пусто"}')
 
         except Exception as e:
             log.error(f'{chat_username} | ОШИБКА: {e}')
+            update_channel(ss, row, last_link, f'❌ Ошибка: {str(e)[:50]}')
             write_log(ss, 'ERROR', f'{chat_username} | {str(e)[:100]}')
 
         await asyncio.sleep(1)
 
-    # Пакетная запись в таблицу
+    # Пакетная запись в Посты
     write_posts(ss, all_new_posts)
 
-    summary = f'ПРОГОН ЗАВЕРШЁН | чатов: {len(allowed_chats)} | проверено: {total_checked} | новых: {total_new} | записано: {total_saved}'
+    # Отправка в Telegram
+    if all_new_posts and tg_token and tg_chats:
+        log.info(f'Отправляю {len(all_new_posts)} постов в TG...')
+        send_to_telegram(all_new_posts, tg_token, tg_chats)
+
+    summary = f'ПРОГОН ЗАВЕРШЁН | чатов: {len(channels)} | новых: {total_new} | записано: {total_saved}'
     log.info(summary)
     write_log(ss, 'INFO', summary)
 
