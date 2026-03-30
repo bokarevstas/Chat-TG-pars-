@@ -23,10 +23,11 @@ LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '35'))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger(__name__)
 
-# Кеш entity: username -> объект чата
-# Позволяет избежать повторных ResolveUsernameRequest на один и тот же канал
+# Кеш entity в рамках одного прогона
 _entity_cache: dict = {}
 
+
+# ─────────────────────────── Google Sheets ───────────────────────────
 
 def get_spreadsheet():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -67,6 +68,12 @@ def get_tg_settings(ss):
 
 
 def get_channels(ss):
+    """
+    Читает лист «Каналы».
+    Колонки: A=адрес, B=last_link, C=статус, D=peer_id (числовой, заполняется автоматически).
+    peer_id сохраняется после первого успешного резолва — при следующих запусках
+    get_entity() по username не вызывается совсем.
+    """
     try:
         sheet = ss.worksheet('Каналы')
         data = sheet.get_all_values()
@@ -78,7 +85,14 @@ def get_channels(ss):
             if not username:
                 continue
             last_link = row[1].strip() if len(row) > 1 else ''
-            channels.append({'username': username, 'last_link': last_link, 'row': i})
+            peer_id_str = row[3].strip() if len(row) > 3 else ''
+            peer_id = int(peer_id_str) if peer_id_str.lstrip('-').isdigit() else None
+            channels.append({
+                'username': username,
+                'last_link': last_link,
+                'peer_id': peer_id,
+                'row': i,
+            })
         return channels
     except Exception as e:
         log.error('Ошибка чтения каналов: ' + str(e))
@@ -91,6 +105,15 @@ def update_channel(ss, row, last_link, status):
         sheet.update([[last_link, status]], 'B' + str(row) + ':C' + str(row))
     except Exception as e:
         log.error('Ошибка обновления канала row=' + str(row) + ': ' + str(e))
+
+
+def save_peer_id(ss, row, peer_id):
+    """Сохраняет числовой peer_id в колонку D — используется при следующих запусках вместо резолва."""
+    try:
+        sheet = ss.worksheet('Каналы')
+        sheet.update([[str(peer_id)]], 'D' + str(row))
+    except Exception as e:
+        log.error('Ошибка сохранения peer_id row=' + str(row) + ': ' + str(e))
 
 
 def write_posts(ss, posts):
@@ -118,10 +141,15 @@ def write_log(ss, level, message):
         safe = str(message)
         if safe and safe[0] in '=+-@':
             safe = "'" + safe
-        sheet.append_row([datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, safe], value_input_option='USER_ENTERED')
+        sheet.append_row(
+            [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, safe],
+            value_input_option='USER_ENTERED'
+        )
     except Exception as e:
         log.error('Ошибка записи лога: ' + str(e))
 
+
+# ─────────────────────────── Telegram helpers ────────────────────────
 
 def send_to_telegram(posts, tg_token, tg_chats):
     if not posts or not tg_token or not tg_chats:
@@ -143,7 +171,11 @@ def send_to_telegram(posts, tg_token, tg_chats):
         for chat_id in tg_chats:
             try:
                 url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
-                data = json.dumps({'chat_id': chat_id, 'text': body, 'disable_web_page_preview': False}).encode('utf-8')
+                data = json.dumps({
+                    'chat_id': chat_id,
+                    'text': body,
+                    'disable_web_page_preview': False
+                }).encode('utf-8')
                 req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
                 urllib.request.urlopen(req, timeout=10)
                 time.sleep(0.3)
@@ -214,12 +246,9 @@ def matches_keywords(text, keywords):
 async def get_entity_safe(client, chat_username: str, max_retries: int = 3):
     """
     Резолвит entity с кешированием и обработкой FloodWaitError.
-
-    - Если username уже в кеше — возвращает из кеша без запроса к TG.
-    - При FloodWaitError ждёт указанное время (но не более 300 сек),
-      затем повторяет. Если flood > 300 сек — поднимает исключение сразу.
-    - При UsernameInvalidError / UsernameNotOccupiedError / ChannelPrivateError
-      поднимает исключение без ретраев.
+    Вызывается ТОЛЬКО если peer_id ещё не известен (первый запуск канала).
+    При FloodWait <= 300s — ждёт и повторяет.
+    При FloodWait > 300s — поднимает исключение (канал пропускается).
     """
     if chat_username in _entity_cache:
         return _entity_cache[chat_username]
@@ -232,7 +261,6 @@ async def get_entity_safe(client, chat_username: str, max_retries: int = 3):
         except FloodWaitError as e:
             wait_sec = e.seconds
             if wait_sec > 300:
-                # Слишком долго ждать — пропускаем канал
                 raise RuntimeError(
                     f'FloodWait слишком большой ({wait_sec}s), канал пропущен'
                 ) from e
@@ -247,6 +275,20 @@ async def get_entity_safe(client, chat_username: str, max_retries: int = 3):
     raise RuntimeError(f'Не удалось получить entity для {chat_username} после {max_retries} попыток')
 
 
+async def get_entity_by_peer_id(client, peer_id: int):
+    """
+    Получает entity по числовому ID без ResolveUsernameRequest.
+    Telethon берёт данные из session cache — API запрос не делается.
+    """
+    if peer_id in _entity_cache:
+        return _entity_cache[peer_id]
+    entity = await client.get_entity(peer_id)
+    _entity_cache[peer_id] = entity
+    return entity
+
+
+# ─────────────────────────── Main ────────────────────────────────────
+
 async def main():
     log.info('Запуск прогона...')
     try:
@@ -259,7 +301,10 @@ async def main():
     keywords_enabled, keywords = get_settings(ss)
     tg_token, tg_chats = get_tg_settings(ss)
     channels = get_channels(ss)
-    log.info('Чатов: ' + str(len(channels)) + ' | Ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ'))
+    log.info(
+        'Чатов: ' + str(len(channels)) +
+        ' | Ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ')
+    )
 
     if not channels:
         log.warning('Нет каналов в листе Каналы')
@@ -274,23 +319,44 @@ async def main():
     total_new = 0
     total_saved = 0
 
-    write_log(ss, 'INFO', 'ПРОГОН НАЧАТ | чатов: ' + str(len(channels)) + ' | ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ'))
+    write_log(ss, 'INFO',
+        'ПРОГОН НАЧАТ | чатов: ' + str(len(channels)) +
+        ' | ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ')
+    )
 
     for ch in channels:
         chat_username = ch['username']
         last_link = ch['last_link']
         last_post_id = extract_post_id(last_link) if last_link else 0
         row = ch['row']
+        saved_peer_id = ch['peer_id']
 
         try:
-            # Резолвим entity один раз с кешированием — исключает повторные ResolveUsernameRequest
-            chat = await get_entity_safe(client, chat_username)
+            # ── Получаем entity ──────────────────────────────────────────────────
+            # Если peer_id уже сохранён в колонке D — используем его (без резолва)
+            # Если нет (первый запуск) — резолвим по username и сохраняем peer_id
+            if saved_peer_id is not None:
+                try:
+                    chat = await get_entity_by_peer_id(client, saved_peer_id)
+                    log.info(f'{chat_username} | peer_id={saved_peer_id} из кеша')
+                except Exception as peer_err:
+                    # peer_id не в session cache (редкий случай) — резолвим заново
+                    log.warning(f'{chat_username} | peer_id недоступен ({peer_err}), резолвлю по username')
+                    chat = await get_entity_safe(client, chat_username)
+                    save_peer_id(ss, row, chat.id)
+            else:
+                # Первый запуск этого канала — резолвим и сохраняем
+                chat = await get_entity_safe(client, chat_username)
+                save_peer_id(ss, row, chat.id)
+                log.info(f'{chat_username} | сохранён peer_id={chat.id}')
+
             chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
 
+            # ── Читаем сообщения ─────────────────────────────────────────────────
+            # Передаём объект chat — повторного резолва нет
             since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
             messages = []
 
-            # Передаём объект chat (не строку) — Telethon не делает повторный резолв
             async for msg in client.iter_messages(chat, limit=100):
                 if last_post_id > 0:
                     if msg.id <= last_post_id:
@@ -314,7 +380,6 @@ async def main():
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
 
-                # Текст в одну строку
                 text = ' '.join(text.split())
 
                 author_name, author_link = get_author_info(msg)
@@ -322,13 +387,12 @@ async def main():
                 date = msg.date.replace(tzinfo=None)
                 new_last_link = link
 
-                # Фильтр ключевых слов только для постов с текстом
+                # Фильтр ключевых слов
                 if keywords_enabled and keywords:
                     if text.strip():
                         if not matches_keywords(text, keywords):
                             continue
                     else:
-                        # Пост без текста — пропускаем если фильтр включён
                         continue
 
                 saved_msgs.append({
@@ -345,25 +409,27 @@ async def main():
             all_new_posts.extend(saved_msgs)
 
             if new_msgs_count > 0:
-                update_channel(ss, row, new_last_link, '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
+                update_channel(ss, row, new_last_link,
+                    '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
             else:
                 update_channel(ss, row, last_link, '✅ Нет новых сообщений')
 
-            log.info(chat_username + ' | новых: ' + str(new_msgs_count) + ' | в таблицу: ' + str(len(saved_msgs)) + ' | lastId: ' + (str(last_post_id) if last_post_id else 'пусто'))
+            log.info(
+                chat_username + ' | новых: ' + str(new_msgs_count) +
+                ' | в таблицу: ' + str(len(saved_msgs)) +
+                ' | lastId: ' + (str(last_post_id) if last_post_id else 'пусто')
+            )
 
         except FloodWaitError as e:
-            # Глобальный FloodWait (не от резолва) — ждём и продолжаем
             wait_sec = e.seconds
             log.warning(f'{chat_username} | FloodWait {wait_sec}s, пропускаю канал')
             update_channel(ss, row, last_link, f'⏳ FloodWait {wait_sec}s')
             write_log(ss, 'WARN', f'{chat_username} | FloodWait {wait_sec}s')
-            # Не ждём здесь — просто пропускаем канал, чтобы не блокировать весь прогон
         except Exception as e:
             log.error(chat_username + ' | ОШИБКА: ' + str(e))
             update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
             write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
 
-        # Пауза между каналами для снижения нагрузки на TG API
         await asyncio.sleep(2)
 
     write_posts(ss, all_new_posts)
@@ -372,7 +438,11 @@ async def main():
         log.info('Отправляю ' + str(len(all_new_posts)) + ' постов в TG...')
         send_to_telegram(all_new_posts, tg_token, tg_chats)
 
-    summary = 'ПРОГОН ЗАВЕРШЁН | чатов: ' + str(len(channels)) + ' | новых: ' + str(total_new) + ' | записано: ' + str(total_saved)
+    summary = (
+        'ПРОГОН ЗАВЕРШЁН | чатов: ' + str(len(channels)) +
+        ' | новых: ' + str(total_new) +
+        ' | записано: ' + str(total_saved)
+    )
     log.info(summary)
     write_log(ss, 'INFO', summary)
 
