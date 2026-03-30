@@ -225,86 +225,87 @@ async def main():
     write_log(ss, 'INFO', 'ПРОГОН НАЧАТ | чатов: ' + str(len(channels)) + ' | ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ'))
 
     for ch in channels:
-        chat_username = ch['username']
-        last_link = ch['last_link']
-        last_post_id = extract_post_id(last_link) if last_link else 0
-        row = ch['row']
+    chat_username = ch['username']
+    last_link = ch['last_link']
+    last_post_id = extract_post_id(last_link) if last_link else 0
+    row = ch['row']
 
-        try:
-            chat = await client.get_entity(chat_username)
-            chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
+    try:
+        since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
+        messages = []
 
-            since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
-            messages = []
+        async for msg in client.iter_messages(chat_username, limit=100):
+            if last_post_id > 0:
+                if msg.id <= last_post_id:
+                    break
+            else:
+                if msg.date < since:
+                    break
+            messages.append(msg)
 
-            async for msg in client.iter_messages(chat_username, limit=100):
-                if last_post_id > 0:
-                    if msg.id <= last_post_id:
-                        break
+        if not messages:
+            update_channel(ss, row, last_link, '✅ Нет новых сообщений')
+            log.info(chat_username + ' | новых: 0')
+            await asyncio.sleep(2)
+            continue
+
+        # Берём chat из первого сообщения — без отдельного get_entity
+        first_msg = messages[0]
+        chat = await first_msg.get_chat()
+        chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
+
+        messages.sort(key=lambda m: m.id)
+        new_msgs_count = len(messages)
+        saved_msgs = []
+        new_last_link = last_link
+
+        for msg in messages:
+            if msg.action is not None:
+                continue
+
+            text = msg.text or msg.message or ''
+            if hasattr(msg, 'caption') and msg.caption:
+                text = msg.caption
+            text = ' '.join(text.split())
+
+            author_name, author_link = get_author_info(msg)
+            link = build_link(chat, msg.id)
+            date = msg.date.replace(tzinfo=None)
+            new_last_link = link
+
+            if keywords_enabled and keywords:
+                if text.strip():
+                    if not matches_keywords(text, keywords):
+                        continue
                 else:
-                    if msg.date < since:
-                        break
-                messages.append(msg)
-
-            messages.sort(key=lambda m: m.id)
-
-            new_msgs_count = len(messages)
-            saved_msgs = []
-            new_last_link = last_link
-
-            for msg in messages:
-                # Пропускаем системные сообщения (создание группы, добавление участников и т.д.)
-                if msg.action is not None:
                     continue
 
-                text = msg.text or msg.message or ''
-                if hasattr(msg, 'caption') and msg.caption:
-                    text = msg.caption
+            saved_msgs.append({
+                'date': date,
+                'chat_name': chat_name,
+                'author_name': author_name,
+                'author_link': author_link,
+                'link': link,
+                'text': text
+            })
 
-                # Текст в одну строку
-                text = ' '.join(text.split())
+        total_new += new_msgs_count
+        total_saved += len(saved_msgs)
+        all_new_posts.extend(saved_msgs)
 
-                author_name, author_link = get_author_info(msg)
-                link = build_link(chat, msg.id)
-                date = msg.date.replace(tzinfo=None)
-                new_last_link = link
+        if new_msgs_count > 0:
+            update_channel(ss, row, new_last_link, '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
+        else:
+            update_channel(ss, row, last_link, '✅ Нет новых сообщений')
 
-                # Фильтр ключевых слов только для постов с текстом
-                if keywords_enabled and keywords:
-                    if text.strip():
-                        if not matches_keywords(text, keywords):
-                            continue
-                    else:
-                        # Пост без текста — пропускаем если фильтр включён
-                        continue
+        log.info(chat_username + ' | новых: ' + str(new_msgs_count) + ' | в таблицу: ' + str(len(saved_msgs)))
 
-                saved_msgs.append({
-                    'date': date,
-                    'chat_name': chat_name,
-                    'author_name': author_name,
-                    'author_link': author_link,
-                    'link': link,
-                    'text': text
-                })
+    except Exception as e:
+        log.error(chat_username + ' | ОШИБКА: ' + str(e))
+        update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
+        write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
 
-            total_new += new_msgs_count
-            total_saved += len(saved_msgs)
-            all_new_posts.extend(saved_msgs)
-
-            if new_msgs_count > 0:
-                update_channel(ss, row, new_last_link, '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
-            else:
-                update_channel(ss, row, last_link, '✅ Нет новых сообщений')
-
-            log.info(chat_username + ' | новых: ' + str(new_msgs_count) + ' | в таблицу: ' + str(len(saved_msgs)) + ' | lastId: ' + (str(last_post_id) if last_post_id else 'пусто'))
-
-        except Exception as e:
-            log.error(chat_username + ' | ОШИБКА: ' + str(e))
-            update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
-            write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
-
-        await asyncio.sleep(1)
-
+    await asyncio.sleep(2)  # увеличили паузу между чатами
     write_posts(ss, all_new_posts)
 
     if all_new_posts and tg_token and tg_chats:
