@@ -7,11 +7,11 @@ import re
 import urllib.request
 from datetime import datetime, timezone, timedelta
 import time
-
 import gspread
 from google.oauth2.service_account import Credentials
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError
 
 API_ID = int(os.environ.get('TG_API_ID', '0'))
 API_HASH = os.environ.get('TG_API_HASH', '')
@@ -23,12 +23,18 @@ LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '35'))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger(__name__)
 
+# Кеш entity: username -> объект чата
+# Позволяет избежать повторных ResolveUsernameRequest на один и тот же канал
+_entity_cache: dict = {}
+
+
 def get_spreadsheet():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds_json = json.loads(base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8'))
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
+
 
 def get_settings(ss):
     try:
@@ -44,6 +50,7 @@ def get_settings(ss):
         log.error('Ошибка чтения настроек: ' + str(e))
         return False, []
 
+
 def get_tg_settings(ss):
     try:
         sheet = ss.worksheet('Настройки')
@@ -57,6 +64,7 @@ def get_tg_settings(ss):
     except Exception as e:
         log.error('Ошибка чтения TG настроек: ' + str(e))
         return '', []
+
 
 def get_channels(ss):
     try:
@@ -76,12 +84,14 @@ def get_channels(ss):
         log.error('Ошибка чтения каналов: ' + str(e))
         return []
 
+
 def update_channel(ss, row, last_link, status):
     try:
         sheet = ss.worksheet('Каналы')
         sheet.update([[last_link, status]], 'B' + str(row) + ':C' + str(row))
     except Exception as e:
         log.error('Ошибка обновления канала row=' + str(row) + ': ' + str(e))
+
 
 def write_posts(ss, posts):
     if not posts:
@@ -101,6 +111,7 @@ def write_posts(ss, posts):
     except Exception as e:
         log.error('Ошибка записи постов: ' + str(e))
 
+
 def write_log(ss, level, message):
     try:
         sheet = ss.worksheet('Логи')
@@ -110,6 +121,7 @@ def write_log(ss, level, message):
         sheet.append_row([datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, safe], value_input_option='USER_ENTERED')
     except Exception as e:
         log.error('Ошибка записи лога: ' + str(e))
+
 
 def send_to_telegram(posts, tg_token, tg_chats):
     if not posts or not tg_token or not tg_chats:
@@ -139,6 +151,7 @@ def send_to_telegram(posts, tg_token, tg_chats):
                 log.error('Ошибка отправки TG в ' + str(chat_id) + ': ' + str(e) + ' | текст: ' + body[:200])
         time.sleep(0.3)
 
+
 def extract_username(raw):
     if not raw:
         return None
@@ -153,9 +166,11 @@ def extract_username(raw):
         return raw
     return None
 
+
 def extract_post_id(link):
     m = re.search(r'/(\d+)$', link)
     return int(m.group(1)) if m else 0
+
 
 def build_link(chat, msg_id):
     username = getattr(chat, 'username', None)
@@ -165,6 +180,7 @@ def build_link(chat, msg_id):
     if chat_id.startswith('-100'):
         chat_id = chat_id[4:]
     return 'https://t.me/c/' + chat_id + '/' + str(msg_id)
+
 
 def get_author_info(msg):
     """Возвращает (имя_фамилия, ссылка_на_аккаунт)."""
@@ -181,6 +197,7 @@ def get_author_info(msg):
     except Exception:
         return '', ''
 
+
 def matches_keywords(text, keywords):
     if not text or not keywords:
         return False
@@ -193,9 +210,45 @@ def matches_keywords(text, keywords):
             return True
     return False
 
+
+async def get_entity_safe(client, chat_username: str, max_retries: int = 3):
+    """
+    Резолвит entity с кешированием и обработкой FloodWaitError.
+
+    - Если username уже в кеше — возвращает из кеша без запроса к TG.
+    - При FloodWaitError ждёт указанное время (но не более 300 сек),
+      затем повторяет. Если flood > 300 сек — поднимает исключение сразу.
+    - При UsernameInvalidError / UsernameNotOccupiedError / ChannelPrivateError
+      поднимает исключение без ретраев.
+    """
+    if chat_username in _entity_cache:
+        return _entity_cache[chat_username]
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            entity = await client.get_entity(chat_username)
+            _entity_cache[chat_username] = entity
+            return entity
+        except FloodWaitError as e:
+            wait_sec = e.seconds
+            if wait_sec > 300:
+                # Слишком долго ждать — пропускаем канал
+                raise RuntimeError(
+                    f'FloodWait слишком большой ({wait_sec}s), канал пропущен'
+                ) from e
+            log.warning(
+                f'FloodWait {wait_sec}s при резолве {chat_username} '
+                f'(попытка {attempt}/{max_retries}), жду...'
+            )
+            await asyncio.sleep(wait_sec + 2)
+        except (UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError) as e:
+            raise RuntimeError(f'Канал недоступен: {e}') from e
+
+    raise RuntimeError(f'Не удалось получить entity для {chat_username} после {max_retries} попыток')
+
+
 async def main():
     log.info('Запуск прогона...')
-
     try:
         ss = get_spreadsheet()
         log.info('Google Sheets подключён')
@@ -206,7 +259,6 @@ async def main():
     keywords_enabled, keywords = get_settings(ss)
     tg_token, tg_chats = get_tg_settings(ss)
     channels = get_channels(ss)
-
     log.info('Чатов: ' + str(len(channels)) + ' | Ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ'))
 
     if not channels:
@@ -225,87 +277,95 @@ async def main():
     write_log(ss, 'INFO', 'ПРОГОН НАЧАТ | чатов: ' + str(len(channels)) + ' | ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ'))
 
     for ch in channels:
-    chat_username = ch['username']
-    last_link = ch['last_link']
-    last_post_id = extract_post_id(last_link) if last_link else 0
-    row = ch['row']
+        chat_username = ch['username']
+        last_link = ch['last_link']
+        last_post_id = extract_post_id(last_link) if last_link else 0
+        row = ch['row']
 
-    try:
-        since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
-        messages = []
+        try:
+            # Резолвим entity один раз с кешированием — исключает повторные ResolveUsernameRequest
+            chat = await get_entity_safe(client, chat_username)
+            chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
 
-        async for msg in client.iter_messages(chat_username, limit=100):
-            if last_post_id > 0:
-                if msg.id <= last_post_id:
-                    break
-            else:
-                if msg.date < since:
-                    break
-            messages.append(msg)
+            since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
+            messages = []
 
-        if not messages:
-            update_channel(ss, row, last_link, '✅ Нет новых сообщений')
-            log.info(chat_username + ' | новых: 0')
-            await asyncio.sleep(2)
-            continue
-
-        # Берём chat из первого сообщения — без отдельного get_entity
-        first_msg = messages[0]
-        chat = await first_msg.get_chat()
-        chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
-
-        messages.sort(key=lambda m: m.id)
-        new_msgs_count = len(messages)
-        saved_msgs = []
-        new_last_link = last_link
-
-        for msg in messages:
-            if msg.action is not None:
-                continue
-
-            text = msg.text or msg.message or ''
-            if hasattr(msg, 'caption') and msg.caption:
-                text = msg.caption
-            text = ' '.join(text.split())
-
-            author_name, author_link = get_author_info(msg)
-            link = build_link(chat, msg.id)
-            date = msg.date.replace(tzinfo=None)
-            new_last_link = link
-
-            if keywords_enabled and keywords:
-                if text.strip():
-                    if not matches_keywords(text, keywords):
-                        continue
+            # Передаём объект chat (не строку) — Telethon не делает повторный резолв
+            async for msg in client.iter_messages(chat, limit=100):
+                if last_post_id > 0:
+                    if msg.id <= last_post_id:
+                        break
                 else:
+                    if msg.date < since:
+                        break
+                messages.append(msg)
+
+            messages.sort(key=lambda m: m.id)
+            new_msgs_count = len(messages)
+            saved_msgs = []
+            new_last_link = last_link
+
+            for msg in messages:
+                # Пропускаем системные сообщения
+                if msg.action is not None:
                     continue
 
-            saved_msgs.append({
-                'date': date,
-                'chat_name': chat_name,
-                'author_name': author_name,
-                'author_link': author_link,
-                'link': link,
-                'text': text
-            })
+                text = msg.text or msg.message or ''
+                if hasattr(msg, 'caption') and msg.caption:
+                    text = msg.caption
 
-        total_new += new_msgs_count
-        total_saved += len(saved_msgs)
-        all_new_posts.extend(saved_msgs)
+                # Текст в одну строку
+                text = ' '.join(text.split())
 
-        if new_msgs_count > 0:
-            update_channel(ss, row, new_last_link, '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
-        else:
-            update_channel(ss, row, last_link, '✅ Нет новых сообщений')
+                author_name, author_link = get_author_info(msg)
+                link = build_link(chat, msg.id)
+                date = msg.date.replace(tzinfo=None)
+                new_last_link = link
 
-        log.info(chat_username + ' | новых: ' + str(new_msgs_count) + ' | в таблицу: ' + str(len(saved_msgs)))
+                # Фильтр ключевых слов только для постов с текстом
+                if keywords_enabled and keywords:
+                    if text.strip():
+                        if not matches_keywords(text, keywords):
+                            continue
+                    else:
+                        # Пост без текста — пропускаем если фильтр включён
+                        continue
 
-    except Exception as e:
-        log.error(chat_username + ' | ОШИБКА: ' + str(e))
-        update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
-        write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
+                saved_msgs.append({
+                    'date': date,
+                    'chat_name': chat_name,
+                    'author_name': author_name,
+                    'author_link': author_link,
+                    'link': link,
+                    'text': text
+                })
 
-    await asyncio.sleep(2)  # увеличили паузу между чатами
+            total_new += new_msgs_count
+            total_saved += len(saved_msgs)
+            all_new_posts.extend(saved_msgs)
+
+            if new_msgs_count > 0:
+                update_channel(ss, row, new_last_link, '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
+            else:
+                update_channel(ss, row, last_link, '✅ Нет новых сообщений')
+
+            log.info(chat_username + ' | новых: ' + str(new_msgs_count) + ' | в таблицу: ' + str(len(saved_msgs)) + ' | lastId: ' + (str(last_post_id) if last_post_id else 'пусто'))
+
+        except FloodWaitError as e:
+            # Глобальный FloodWait (не от резолва) — ждём и продолжаем
+            wait_sec = e.seconds
+            log.warning(f'{chat_username} | FloodWait {wait_sec}s, пропускаю канал')
+            update_channel(ss, row, last_link, f'⏳ FloodWait {wait_sec}s')
+            write_log(ss, 'WARN', f'{chat_username} | FloodWait {wait_sec}s')
+            # Не ждём здесь — просто пропускаем канал, чтобы не блокировать весь прогон
+        except Exception as e:
+            log.error(chat_username + ' | ОШИБКА: ' + str(e))
+            update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
+            write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
+
+        # Пауза между каналами для снижения нагрузки на TG API
+        await asyncio.sleep(2)
+
     write_posts(ss, all_new_posts)
 
     if all_new_posts and tg_token and tg_chats:
@@ -317,6 +377,7 @@ async def main():
     write_log(ss, 'INFO', summary)
 
     await client.disconnect()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
