@@ -17,7 +17,6 @@ from telethon.errors import (
     UsernameNotOccupiedError,
     ChannelPrivateError,
     ChatAdminRequiredError,
-    InviteHashInvalidError,
 )
 from telethon.tl.types import InputPeerChannel
 
@@ -38,7 +37,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Кеш entity в рамках одного прогона: ключ -> объект чата
+# Кеш entity в рамках одного прогона
 _entity_cache: dict = {}
 
 
@@ -48,13 +47,6 @@ _entity_cache: dict = {}
 
 def parse_channel_address(raw: str) -> dict:
     """
-    Разбирает адрес канала из колонки A и возвращает dict:
-      {
-        'type': 'username' | 'private',
-        'username': str | None,   # для публичных
-        'channel_id': int | None, # для приватных (из t.me/c/ID/...)
-      }
-
     Поддерживаемые форматы:
       @username
       username
@@ -71,11 +63,11 @@ def parse_channel_address(raw: str) -> dict:
     if m:
         return {'type': 'private', 'username': None, 'channel_id': int(m.group(1))}
 
-    # Числовой ID напрямую (с -100 или без)
+    # Числовой ID напрямую
     if re.match(r'^-?\d+$', raw):
         cid = int(raw)
         if cid < 0:
-            cid = int(str(cid).lstrip('-100') or str(abs(cid)))
+            cid = int(str(abs(cid)).lstrip('100') or str(abs(cid)))
         return {'type': 'private', 'username': None, 'channel_id': cid}
 
     # Публичный: https://t.me/username или @username или просто username
@@ -108,7 +100,6 @@ def build_link(chat, msg_id: int) -> str:
 
 
 def get_author_info(msg):
-    """Возвращает (имя_фамилия, ссылка_на_аккаунт)."""
     try:
         if not msg.sender:
             return '', ''
@@ -117,19 +108,32 @@ def get_author_info(msg):
         last = getattr(sender, 'last_name', '') or ''
         username = getattr(sender, 'username', '') or ''
         full_name = (first + ' ' + last).strip()
-        author_link = (f'https://t.me/{username}') if username else ''
+        author_link = f'https://t.me/{username}' if username else ''
         return full_name, author_link
     except Exception:
         return '', ''
 
 
 def matches_keywords(text: str, keywords: list) -> bool:
+    """Возвращает True если текст содержит хотя бы одно ключевое слово."""
     if not text or not keywords:
         return False
     text_lower = text.lower()
     for kw in keywords:
         kw_lower = kw.lower().strip().rstrip('*')
         if kw_lower and kw_lower in text_lower:
+            return True
+    return False
+
+
+def matches_negatives(text: str, negatives: list) -> bool:
+    """Возвращает True если текст содержит хотя бы одно негативное слово."""
+    if not text or not negatives:
+        return False
+    text_lower = text.lower()
+    for neg in negatives:
+        neg_lower = neg.lower().strip().rstrip('*')
+        if neg_lower and neg_lower in text_lower:
             return True
     return False
 
@@ -150,18 +154,34 @@ def get_spreadsheet():
 
 
 def get_settings(ss):
+    """
+    Читает лист «Настройки»:
+      D = ключевые слова (строки 2+)
+      E = негативные слова (строки 2+)
+      F1 = чекбокс включения фильтра ключевых слов (TRUE/FALSE)
+    """
     try:
         sheet = ss.worksheet('Настройки')
         data = sheet.get_all_values()
-        keywords_enabled = str(data[0][4]).upper() == 'TRUE' if data and len(data[0]) > 4 else False
+
+        # F1 — чекбокс включения фильтра (колонка F = индекс 5)
+        keywords_enabled = str(data[0][5]).upper() == 'TRUE' if data and len(data[0]) > 5 else False
+
         keywords = []
+        negatives = []
+
         for row in data[1:]:
+            # Колонка D (индекс 3) — ключевые слова
             if len(row) > 3 and row[3].strip():
                 keywords.append(row[3].strip())
-        return keywords_enabled, keywords
+            # Колонка E (индекс 4) — негативные слова
+            if len(row) > 4 and row[4].strip():
+                negatives.append(row[4].strip())
+
+        return keywords_enabled, keywords, negatives
     except Exception as e:
         log.error('Ошибка чтения настроек: ' + str(e))
-        return False, []
+        return False, [], []
 
 
 def get_tg_settings(ss):
@@ -183,10 +203,10 @@ def get_channels(ss):
     """
     Лист «Каналы»:
       A = адрес (username / t.me/c/ID/...)
-      B = last_link  (последний обработанный пост)
+      B = last_link
       C = статус
-      D = peer_id    (числовой ID — кеш, заполняется автоматически)
-      E = access_hash (нужен для приватных каналов — заполняется автоматически)
+      D = peer_id     (заполняется автоматически)
+      E = access_hash (заполняется автоматически)
     """
     try:
         sheet = ss.worksheet('Каналы')
@@ -305,16 +325,10 @@ def send_to_telegram(posts, tg_token, tg_chats):
 
 
 # ══════════════════════════════════════════════════════
-#  Получение entity — ядро защиты от флуда
+#  Получение entity — защита от флуда
 # ══════════════════════════════════════════════════════
 
 async def resolve_with_flood_protection(client, identifier, label: str, max_retries: int = 3):
-    """
-    Вызывает client.get_entity(identifier) с защитой от FloodWait.
-    - identifier: строка username или числовой peer_id или InputPeerChannel
-    - При FloodWait <= MAX_FLOOD_WAIT_SEC — ждёт и повторяет
-    - При FloodWait > MAX_FLOOD_WAIT_SEC — поднимает RuntimeError (канал пропускается)
-    """
     cache_key = str(identifier)
     if cache_key in _entity_cache:
         return _entity_cache[cache_key]
@@ -340,22 +354,19 @@ async def resolve_with_flood_protection(client, identifier, label: str, max_retr
 
 async def get_chat_entity(client, ch: dict) -> tuple:
     """
-    Возвращает (chat_entity, is_new) где is_new=True если peer_id был только что получен.
-
-    Стратегия (по приоритету, от безопасного к затратному):
-
-    1. peer_id + access_hash уже сохранены → InputPeerChannel → без резолва, без API запроса
-    2. Приватная супергруппа (t.me/c/ID) + peer_id в таблице → то же самое
-    3. Приватная супергруппа (t.me/c/ID) + нет peer_id → get_entity(channel_id) → session cache
-    4. Публичный канал + peer_id сохранён → get_entity(peer_id) → session cache
-    5. Публичный канал + нет peer_id → get_entity(username) → ResolveUsernameRequest (1 раз!)
+    Возвращает (chat_entity, is_new).
+    Приоритет стратегий (от быстрого к медленному):
+      1. peer_id + access_hash → InputPeerChannel (0 запросов)
+      2. Приватный channel_id  → session cache
+      3. Публичный peer_id     → session cache
+      4. Публичный username    → ResolveUsernameRequest (1 раз, потом кеш)
     """
     addr = ch['addr']
     peer_id = ch['peer_id']
     access_hash = ch['access_hash']
     label = ch['raw']
 
-    # ── Вариант 1: оба ID сохранены → прямой InputPeerChannel, ноль запросов ──
+    # 1. Оба ID сохранены → прямой InputPeerChannel, ноль запросов
     if peer_id is not None and access_hash is not None:
         cache_key = f'input_{peer_id}'
         if cache_key not in _entity_cache:
@@ -364,29 +375,25 @@ async def get_chat_entity(client, ch: dict) -> tuple:
             _entity_cache[cache_key] = entity
         return _entity_cache[cache_key], False
 
-    # ── Вариант 2: приватная супергруппа, channel_id известен из адреса ──
+    # 2. Приватная супергруппа, channel_id из адреса
     if addr['type'] == 'private' and addr['channel_id'] is not None:
-        channel_id = addr['channel_id']
-        # Сначала пробуем через числовой ID (может быть в session cache)
         try:
-            entity = await resolve_with_flood_protection(client, channel_id, label)
+            entity = await resolve_with_flood_protection(client, addr['channel_id'], label)
             return entity, True
         except Exception:
-            # Если не в session — нужен access_hash, без него не получить
             raise RuntimeError(
-                f'Приватный канал {channel_id}: нет в session cache. '
+                f'Приватный канал {addr["channel_id"]}: нет в session cache. '
                 f'Убедитесь что аккаунт состоит в этом канале/группе.'
             )
 
-    # ── Вариант 3: публичный, peer_id сохранён → session cache ──
+    # 3. Публичный, peer_id сохранён → session cache
     if peer_id is not None:
         entity = await resolve_with_flood_protection(client, peer_id, label)
         return entity, False
 
-    # ── Вариант 4: публичный, первый запуск → резолв по username (ResolveUsernameRequest) ──
-    username = addr['username']
-    if username:
-        entity = await resolve_with_flood_protection(client, username, label)
+    # 4. Публичный, первый запуск → резолв по username
+    if addr['username']:
+        entity = await resolve_with_flood_protection(client, addr['username'], label)
         return entity, True
 
     raise RuntimeError(f'Не удалось определить идентификатор для канала: {label}')
@@ -405,13 +412,14 @@ async def main():
         log.error('Ошибка Google Sheets: ' + str(e))
         return
 
-    keywords_enabled, keywords = get_settings(ss)
+    keywords_enabled, keywords, negatives = get_settings(ss)
     tg_token, tg_chats = get_tg_settings(ss)
     channels = get_channels(ss)
 
     log.info(
         f'Чатов: {len(channels)} | '
-        f'Ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}'
+        f'Ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"} | '
+        f'Негативы: {len(negatives)} шт'
     )
 
     if not channels:
@@ -426,10 +434,12 @@ async def main():
     all_new_posts = []
     total_new = 0
     total_saved = 0
+    total_skipped_negative = 0
 
     write_log(ss, 'INFO',
         f'ПРОГОН НАЧАТ | чатов: {len(channels)} | '
-        f'ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}'
+        f'ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"} | '
+        f'негативы: {len(negatives)} шт'
     )
 
     for ch in channels:
@@ -442,7 +452,6 @@ async def main():
             # ── Получаем entity ───────────────────────────────────────────
             chat, is_new = await get_chat_entity(client, ch)
 
-            # Если получили впервые — сохраняем peer_id и access_hash в таблицу
             if is_new:
                 ah = getattr(chat, 'access_hash', 0) or 0
                 save_channel_ids(ss, row, chat.id, ah)
@@ -451,7 +460,6 @@ async def main():
             chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or label
 
             # ── Читаем сообщения ──────────────────────────────────────────
-            # Передаём объект chat — повторного резолва нет
             since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
             messages = []
 
@@ -467,6 +475,7 @@ async def main():
             messages.sort(key=lambda m: m.id)
             new_msgs_count = len(messages)
             saved_msgs = []
+            skipped_neg = 0
             new_last_link = last_link
 
             for msg in messages:
@@ -477,7 +486,6 @@ async def main():
                 text = msg.text or msg.message or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
-
                 text = ' '.join(text.split())
 
                 author_name, author_link = get_author_info(msg)
@@ -485,12 +493,22 @@ async def main():
                 date = msg.date.replace(tzinfo=None)
                 new_last_link = link
 
-                # Фильтр ключевых слов
+                # ── Фильтр ключевых слов ──────────────────────────────────
                 if keywords_enabled and keywords:
                     if text.strip():
                         if not matches_keywords(text, keywords):
                             continue
                     else:
+                        # Пост без текста пропускаем если фильтр включён
+                        continue
+
+                # ── Фильтр негативных слов ────────────────────────────────
+                # Работает независимо от keywords_enabled:
+                # если негативы заданы — проверяем всегда
+                if negatives and text.strip():
+                    if matches_negatives(text, negatives):
+                        skipped_neg += 1
+                        log.info(f'{label} | пост {msg.id} отклонён по негативу')
                         continue
 
                 saved_msgs.append({
@@ -504,21 +522,25 @@ async def main():
 
             total_new += new_msgs_count
             total_saved += len(saved_msgs)
+            total_skipped_negative += skipped_neg
             all_new_posts.extend(saved_msgs)
 
+            status_parts = []
             if new_msgs_count > 0:
-                update_channel(ss, row, new_last_link,
-                    f'✅ Новых: {new_msgs_count} | Записано: {len(saved_msgs)}')
+                status_parts.append(f'Новых: {new_msgs_count}')
+                status_parts.append(f'Записано: {len(saved_msgs)}')
+                if skipped_neg:
+                    status_parts.append(f'Негативов: {skipped_neg}')
+                update_channel(ss, row, new_last_link, '✅ ' + ' | '.join(status_parts))
             else:
                 update_channel(ss, row, last_link, '✅ Нет новых сообщений')
 
             log.info(
-                f'{label} | новых: {new_msgs_count} | в таблицу: {len(saved_msgs)} | '
-                f'lastId: {last_post_id if last_post_id else "пусто"}'
+                f'{label} | новых: {new_msgs_count} | записано: {len(saved_msgs)} | '
+                f'негативов: {skipped_neg} | lastId: {last_post_id if last_post_id else "пусто"}'
             )
 
         except FloodWaitError as e:
-            # FloodWait пробился наружу (например из iter_messages)
             wait_sec = e.seconds
             log.warning(f'{label} | FloodWait {wait_sec}s, пропускаю канал')
             update_channel(ss, row, last_link, f'⏳ FloodWait {wait_sec}s')
@@ -528,7 +550,6 @@ async def main():
             update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
             write_log(ss, 'ERROR', f'{label} | {str(e)[:100]}')
 
-        # Пауза между каналами — снижает риск флуда
         await asyncio.sleep(2)
 
     write_posts(ss, all_new_posts)
@@ -539,7 +560,8 @@ async def main():
 
     summary = (
         f'ПРОГОН ЗАВЕРШЁН | чатов: {len(channels)} | '
-        f'новых: {total_new} | записано: {total_saved}'
+        f'новых: {total_new} | записано: {total_saved} | '
+        f'отклонено по негативам: {total_skipped_negative}'
     )
     log.info(summary)
     write_log(ss, 'INFO', summary)
