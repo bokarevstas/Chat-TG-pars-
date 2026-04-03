@@ -11,7 +11,15 @@ import gspread
 from google.oauth2.service_account import Credentials
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError
+from telethon.errors import (
+    FloodWaitError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    InviteHashInvalidError,
+)
+from telethon.tl.types import InputPeerChannel
 
 API_ID = int(os.environ.get('TG_API_ID', '0'))
 API_HASH = os.environ.get('TG_API_HASH', '')
@@ -20,17 +28,121 @@ SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_BASE64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '35'))
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+# Максимальное время ожидания FloodWait — если больше, канал пропускается
+MAX_FLOOD_WAIT_SEC = 300
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 log = logging.getLogger(__name__)
 
-# Кеш entity в рамках одного прогона
+# Кеш entity в рамках одного прогона: ключ -> объект чата
 _entity_cache: dict = {}
 
 
-# ─────────────────────────── Google Sheets ───────────────────────────
+# ══════════════════════════════════════════════════════
+#  Парсинг адреса канала
+# ══════════════════════════════════════════════════════
+
+def parse_channel_address(raw: str) -> dict:
+    """
+    Разбирает адрес канала из колонки A и возвращает dict:
+      {
+        'type': 'username' | 'private',
+        'username': str | None,   # для публичных
+        'channel_id': int | None, # для приватных (из t.me/c/ID/...)
+      }
+
+    Поддерживаемые форматы:
+      @username
+      username
+      https://t.me/username
+      https://t.me/c/1924271762/3178   <- приватная супергруппа
+      -1001924271762                    <- числовой ID
+    """
+    raw = raw.strip()
+    if not raw:
+        return {}
+
+    # Приватная супергруппа: t.me/c/<channel_id>/<msg_id>
+    m = re.match(r'(?:https?://)?t\.me/c/(\d+)(?:/\d+)?', raw)
+    if m:
+        return {'type': 'private', 'username': None, 'channel_id': int(m.group(1))}
+
+    # Числовой ID напрямую (с -100 или без)
+    if re.match(r'^-?\d+$', raw):
+        cid = int(raw)
+        if cid < 0:
+            cid = int(str(cid).lstrip('-100') or str(abs(cid)))
+        return {'type': 'private', 'username': None, 'channel_id': cid}
+
+    # Публичный: https://t.me/username или @username или просто username
+    m = re.match(r'(?:https?://)?t\.me/([a-zA-Z0-9_]+)', raw)
+    if m:
+        return {'type': 'username', 'username': m.group(1), 'channel_id': None}
+
+    if raw.startswith('@'):
+        return {'type': 'username', 'username': raw[1:], 'channel_id': None}
+
+    if re.match(r'^[a-zA-Z0-9_]+$', raw):
+        return {'type': 'username', 'username': raw, 'channel_id': None}
+
+    return {}
+
+
+def extract_post_id(link: str) -> int:
+    m = re.search(r'/(\d+)$', link)
+    return int(m.group(1)) if m else 0
+
+
+def build_link(chat, msg_id: int) -> str:
+    username = getattr(chat, 'username', None)
+    if username:
+        return f'https://t.me/{username}/{msg_id}'
+    chat_id = str(chat.id)
+    if chat_id.startswith('-100'):
+        chat_id = chat_id[4:]
+    return f'https://t.me/c/{chat_id}/{msg_id}'
+
+
+def get_author_info(msg):
+    """Возвращает (имя_фамилия, ссылка_на_аккаунт)."""
+    try:
+        if not msg.sender:
+            return '', ''
+        sender = msg.sender
+        first = getattr(sender, 'first_name', '') or ''
+        last = getattr(sender, 'last_name', '') or ''
+        username = getattr(sender, 'username', '') or ''
+        full_name = (first + ' ' + last).strip()
+        author_link = (f'https://t.me/{username}') if username else ''
+        return full_name, author_link
+    except Exception:
+        return '', ''
+
+
+def matches_keywords(text: str, keywords: list) -> bool:
+    if not text or not keywords:
+        return False
+    text_lower = text.lower()
+    for kw in keywords:
+        kw_lower = kw.lower().strip().rstrip('*')
+        if kw_lower and kw_lower in text_lower:
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════
+#  Google Sheets
+# ══════════════════════════════════════════════════════
 
 def get_spreadsheet():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
     creds_json = json.loads(base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8'))
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     gc = gspread.authorize(creds)
@@ -69,10 +181,12 @@ def get_tg_settings(ss):
 
 def get_channels(ss):
     """
-    Читает лист «Каналы».
-    Колонки: A=адрес, B=last_link, C=статус, D=peer_id (числовой, заполняется автоматически).
-    peer_id сохраняется после первого успешного резолва — при следующих запусках
-    get_entity() по username не вызывается совсем.
+    Лист «Каналы»:
+      A = адрес (username / t.me/c/ID/...)
+      B = last_link  (последний обработанный пост)
+      C = статус
+      D = peer_id    (числовой ID — кеш, заполняется автоматически)
+      E = access_hash (нужен для приватных каналов — заполняется автоматически)
     """
     try:
         sheet = ss.worksheet('Каналы')
@@ -81,16 +195,20 @@ def get_channels(ss):
         for i, row in enumerate(data[1:], start=2):
             if not row or not row[0].strip():
                 continue
-            username = extract_username(row[0].strip())
-            if not username:
+            addr = parse_channel_address(row[0].strip())
+            if not addr:
                 continue
             last_link = row[1].strip() if len(row) > 1 else ''
             peer_id_str = row[3].strip() if len(row) > 3 else ''
             peer_id = int(peer_id_str) if peer_id_str.lstrip('-').isdigit() else None
+            access_hash_str = row[4].strip() if len(row) > 4 else ''
+            access_hash = int(access_hash_str) if access_hash_str.lstrip('-').isdigit() else None
             channels.append({
-                'username': username,
+                'raw': row[0].strip(),
+                'addr': addr,
                 'last_link': last_link,
                 'peer_id': peer_id,
+                'access_hash': access_hash,
                 'row': i,
             })
         return channels
@@ -102,18 +220,18 @@ def get_channels(ss):
 def update_channel(ss, row, last_link, status):
     try:
         sheet = ss.worksheet('Каналы')
-        sheet.update([[last_link, status]], 'B' + str(row) + ':C' + str(row))
+        sheet.update([[last_link, status]], f'B{row}:C{row}')
     except Exception as e:
-        log.error('Ошибка обновления канала row=' + str(row) + ': ' + str(e))
+        log.error(f'Ошибка обновления канала row={row}: {e}')
 
 
-def save_peer_id(ss, row, peer_id):
-    """Сохраняет числовой peer_id в колонку D — используется при следующих запусках вместо резолва."""
+def save_channel_ids(ss, row, peer_id: int, access_hash: int):
+    """Сохраняет peer_id → D и access_hash → E после первого резолва."""
     try:
         sheet = ss.worksheet('Каналы')
-        sheet.update([[str(peer_id)]], 'D' + str(row))
+        sheet.update([[str(peer_id), str(access_hash)]], f'D{row}:E{row}')
     except Exception as e:
-        log.error('Ошибка сохранения peer_id row=' + str(row) + ': ' + str(e))
+        log.error(f'Ошибка сохранения peer_id/access_hash row={row}: {e}')
 
 
 def write_posts(ss, posts):
@@ -149,7 +267,9 @@ def write_log(ss, level, message):
         log.error('Ошибка записи лога: ' + str(e))
 
 
-# ─────────────────────────── Telegram helpers ────────────────────────
+# ══════════════════════════════════════════════════════
+#  Telegram Bot отправка
+# ══════════════════════════════════════════════════════
 
 def send_to_telegram(posts, tg_token, tg_chats):
     if not posts or not tg_token or not tg_chats:
@@ -170,7 +290,7 @@ def send_to_telegram(posts, tg_token, tg_chats):
             body = body[:4000] + '...'
         for chat_id in tg_chats:
             try:
-                url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
+                url = f'https://api.telegram.org/bot{tg_token}/sendMessage'
                 data = json.dumps({
                     'chat_id': chat_id,
                     'text': body,
@@ -180,114 +300,101 @@ def send_to_telegram(posts, tg_token, tg_chats):
                 urllib.request.urlopen(req, timeout=10)
                 time.sleep(0.3)
             except Exception as e:
-                log.error('Ошибка отправки TG в ' + str(chat_id) + ': ' + str(e) + ' | текст: ' + body[:200])
+                log.error(f'Ошибка отправки TG в {chat_id}: {e} | текст: {body[:200]}')
         time.sleep(0.3)
 
 
-def extract_username(raw):
-    if not raw:
-        return None
-    m = re.match(r'(?:https?://)?t\.me/([a-zA-Z0-9_]+)', raw)
-    if m:
-        return m.group(1)
-    if raw.startswith('@'):
-        return raw[1:]
-    if re.match(r'^[a-zA-Z0-9_]+$', raw):
-        return raw
-    if re.match(r'^-?\d+$', raw):
-        return raw
-    return None
+# ══════════════════════════════════════════════════════
+#  Получение entity — ядро защиты от флуда
+# ══════════════════════════════════════════════════════
 
-
-def extract_post_id(link):
-    m = re.search(r'/(\d+)$', link)
-    return int(m.group(1)) if m else 0
-
-
-def build_link(chat, msg_id):
-    username = getattr(chat, 'username', None)
-    if username:
-        return 'https://t.me/' + username + '/' + str(msg_id)
-    chat_id = str(chat.id)
-    if chat_id.startswith('-100'):
-        chat_id = chat_id[4:]
-    return 'https://t.me/c/' + chat_id + '/' + str(msg_id)
-
-
-def get_author_info(msg):
-    """Возвращает (имя_фамилия, ссылка_на_аккаунт)."""
-    try:
-        if not msg.sender:
-            return '', ''
-        sender = msg.sender
-        first = getattr(sender, 'first_name', '') or ''
-        last = getattr(sender, 'last_name', '') or ''
-        username = getattr(sender, 'username', '') or ''
-        full_name = (first + ' ' + last).strip()
-        author_link = ('https://t.me/' + username) if username else ''
-        return full_name, author_link
-    except Exception:
-        return '', ''
-
-
-def matches_keywords(text, keywords):
-    if not text or not keywords:
-        return False
-    text_lower = text.lower()
-    for kw in keywords:
-        kw_lower = kw.lower().strip().rstrip('*')
-        if not kw_lower:
-            continue
-        if kw_lower in text_lower:
-            return True
-    return False
-
-
-async def get_entity_safe(client, chat_username: str, max_retries: int = 3):
+async def resolve_with_flood_protection(client, identifier, label: str, max_retries: int = 3):
     """
-    Резолвит entity с кешированием и обработкой FloodWaitError.
-    Вызывается ТОЛЬКО если peer_id ещё не известен (первый запуск канала).
-    При FloodWait <= 300s — ждёт и повторяет.
-    При FloodWait > 300s — поднимает исключение (канал пропускается).
+    Вызывает client.get_entity(identifier) с защитой от FloodWait.
+    - identifier: строка username или числовой peer_id или InputPeerChannel
+    - При FloodWait <= MAX_FLOOD_WAIT_SEC — ждёт и повторяет
+    - При FloodWait > MAX_FLOOD_WAIT_SEC — поднимает RuntimeError (канал пропускается)
     """
-    if chat_username in _entity_cache:
-        return _entity_cache[chat_username]
+    cache_key = str(identifier)
+    if cache_key in _entity_cache:
+        return _entity_cache[cache_key]
 
     for attempt in range(1, max_retries + 1):
         try:
-            entity = await client.get_entity(chat_username)
-            _entity_cache[chat_username] = entity
+            entity = await client.get_entity(identifier)
+            _entity_cache[cache_key] = entity
             return entity
         except FloodWaitError as e:
             wait_sec = e.seconds
-            if wait_sec > 300:
-                raise RuntimeError(
-                    f'FloodWait слишком большой ({wait_sec}s), канал пропущен'
-                ) from e
-            log.warning(
-                f'FloodWait {wait_sec}s при резолве {chat_username} '
-                f'(попытка {attempt}/{max_retries}), жду...'
-            )
+            if wait_sec > MAX_FLOOD_WAIT_SEC:
+                raise RuntimeError(f'FloodWait слишком большой ({wait_sec}s), канал пропущен') from e
+            log.warning(f'{label} | FloodWait {wait_sec}s (попытка {attempt}/{max_retries}), жду...')
             await asyncio.sleep(wait_sec + 2)
-        except (UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError) as e:
+        except (UsernameInvalidError, UsernameNotOccupiedError) as e:
+            raise RuntimeError(f'Неверный username: {e}') from e
+        except (ChannelPrivateError, ChatAdminRequiredError) as e:
             raise RuntimeError(f'Канал недоступен: {e}') from e
 
-    raise RuntimeError(f'Не удалось получить entity для {chat_username} после {max_retries} попыток')
+    raise RuntimeError(f'{label} | Не удалось получить entity после {max_retries} попыток')
 
 
-async def get_entity_by_peer_id(client, peer_id: int):
+async def get_chat_entity(client, ch: dict) -> tuple:
     """
-    Получает entity по числовому ID без ResolveUsernameRequest.
-    Telethon берёт данные из session cache — API запрос не делается.
+    Возвращает (chat_entity, is_new) где is_new=True если peer_id был только что получен.
+
+    Стратегия (по приоритету, от безопасного к затратному):
+
+    1. peer_id + access_hash уже сохранены → InputPeerChannel → без резолва, без API запроса
+    2. Приватная супергруппа (t.me/c/ID) + peer_id в таблице → то же самое
+    3. Приватная супергруппа (t.me/c/ID) + нет peer_id → get_entity(channel_id) → session cache
+    4. Публичный канал + peer_id сохранён → get_entity(peer_id) → session cache
+    5. Публичный канал + нет peer_id → get_entity(username) → ResolveUsernameRequest (1 раз!)
     """
-    if peer_id in _entity_cache:
-        return _entity_cache[peer_id]
-    entity = await client.get_entity(peer_id)
-    _entity_cache[peer_id] = entity
-    return entity
+    addr = ch['addr']
+    peer_id = ch['peer_id']
+    access_hash = ch['access_hash']
+    label = ch['raw']
+
+    # ── Вариант 1: оба ID сохранены → прямой InputPeerChannel, ноль запросов ──
+    if peer_id is not None and access_hash is not None:
+        cache_key = f'input_{peer_id}'
+        if cache_key not in _entity_cache:
+            peer = InputPeerChannel(channel_id=peer_id, access_hash=access_hash)
+            entity = await client.get_entity(peer)
+            _entity_cache[cache_key] = entity
+        return _entity_cache[cache_key], False
+
+    # ── Вариант 2: приватная супергруппа, channel_id известен из адреса ──
+    if addr['type'] == 'private' and addr['channel_id'] is not None:
+        channel_id = addr['channel_id']
+        # Сначала пробуем через числовой ID (может быть в session cache)
+        try:
+            entity = await resolve_with_flood_protection(client, channel_id, label)
+            return entity, True
+        except Exception:
+            # Если не в session — нужен access_hash, без него не получить
+            raise RuntimeError(
+                f'Приватный канал {channel_id}: нет в session cache. '
+                f'Убедитесь что аккаунт состоит в этом канале/группе.'
+            )
+
+    # ── Вариант 3: публичный, peer_id сохранён → session cache ──
+    if peer_id is not None:
+        entity = await resolve_with_flood_protection(client, peer_id, label)
+        return entity, False
+
+    # ── Вариант 4: публичный, первый запуск → резолв по username (ResolveUsernameRequest) ──
+    username = addr['username']
+    if username:
+        entity = await resolve_with_flood_protection(client, username, label)
+        return entity, True
+
+    raise RuntimeError(f'Не удалось определить идентификатор для канала: {label}')
 
 
-# ─────────────────────────── Main ────────────────────────────────────
+# ══════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════
 
 async def main():
     log.info('Запуск прогона...')
@@ -301,9 +408,10 @@ async def main():
     keywords_enabled, keywords = get_settings(ss)
     tg_token, tg_chats = get_tg_settings(ss)
     channels = get_channels(ss)
+
     log.info(
-        'Чатов: ' + str(len(channels)) +
-        ' | Ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ')
+        f'Чатов: {len(channels)} | '
+        f'Ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}'
     )
 
     if not channels:
@@ -320,39 +428,29 @@ async def main():
     total_saved = 0
 
     write_log(ss, 'INFO',
-        'ПРОГОН НАЧАТ | чатов: ' + str(len(channels)) +
-        ' | ключи: ' + ('ВКЛ (' + str(len(keywords)) + ' шт)' if keywords_enabled else 'ВЫКЛ')
+        f'ПРОГОН НАЧАТ | чатов: {len(channels)} | '
+        f'ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"}'
     )
 
     for ch in channels:
-        chat_username = ch['username']
+        label = ch['raw']
         last_link = ch['last_link']
         last_post_id = extract_post_id(last_link) if last_link else 0
         row = ch['row']
-        saved_peer_id = ch['peer_id']
 
         try:
-            # ── Получаем entity ──────────────────────────────────────────────────
-            # Если peer_id уже сохранён в колонке D — используем его (без резолва)
-            # Если нет (первый запуск) — резолвим по username и сохраняем peer_id
-            if saved_peer_id is not None:
-                try:
-                    chat = await get_entity_by_peer_id(client, saved_peer_id)
-                    log.info(f'{chat_username} | peer_id={saved_peer_id} из кеша')
-                except Exception as peer_err:
-                    # peer_id не в session cache (редкий случай) — резолвим заново
-                    log.warning(f'{chat_username} | peer_id недоступен ({peer_err}), резолвлю по username')
-                    chat = await get_entity_safe(client, chat_username)
-                    save_peer_id(ss, row, chat.id)
-            else:
-                # Первый запуск этого канала — резолвим и сохраняем
-                chat = await get_entity_safe(client, chat_username)
-                save_peer_id(ss, row, chat.id)
-                log.info(f'{chat_username} | сохранён peer_id={chat.id}')
+            # ── Получаем entity ───────────────────────────────────────────
+            chat, is_new = await get_chat_entity(client, ch)
 
-            chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_username)
+            # Если получили впервые — сохраняем peer_id и access_hash в таблицу
+            if is_new:
+                ah = getattr(chat, 'access_hash', 0) or 0
+                save_channel_ids(ss, row, chat.id, ah)
+                log.info(f'{label} | сохранён peer_id={chat.id} access_hash={ah}')
 
-            # ── Читаем сообщения ─────────────────────────────────────────────────
+            chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or label
+
+            # ── Читаем сообщения ──────────────────────────────────────────
             # Передаём объект chat — повторного резолва нет
             since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
             messages = []
@@ -410,38 +508,38 @@ async def main():
 
             if new_msgs_count > 0:
                 update_channel(ss, row, new_last_link,
-                    '✅ Новых: ' + str(new_msgs_count) + ' | Записано: ' + str(len(saved_msgs)))
+                    f'✅ Новых: {new_msgs_count} | Записано: {len(saved_msgs)}')
             else:
                 update_channel(ss, row, last_link, '✅ Нет новых сообщений')
 
             log.info(
-                chat_username + ' | новых: ' + str(new_msgs_count) +
-                ' | в таблицу: ' + str(len(saved_msgs)) +
-                ' | lastId: ' + (str(last_post_id) if last_post_id else 'пусто')
+                f'{label} | новых: {new_msgs_count} | в таблицу: {len(saved_msgs)} | '
+                f'lastId: {last_post_id if last_post_id else "пусто"}'
             )
 
         except FloodWaitError as e:
+            # FloodWait пробился наружу (например из iter_messages)
             wait_sec = e.seconds
-            log.warning(f'{chat_username} | FloodWait {wait_sec}s, пропускаю канал')
+            log.warning(f'{label} | FloodWait {wait_sec}s, пропускаю канал')
             update_channel(ss, row, last_link, f'⏳ FloodWait {wait_sec}s')
-            write_log(ss, 'WARN', f'{chat_username} | FloodWait {wait_sec}s')
+            write_log(ss, 'WARN', f'{label} | FloodWait {wait_sec}s')
         except Exception as e:
-            log.error(chat_username + ' | ОШИБКА: ' + str(e))
+            log.error(f'{label} | ОШИБКА: {e}')
             update_channel(ss, row, last_link, '❌ Ошибка: ' + str(e)[:50])
-            write_log(ss, 'ERROR', chat_username + ' | ' + str(e)[:100])
+            write_log(ss, 'ERROR', f'{label} | {str(e)[:100]}')
 
+        # Пауза между каналами — снижает риск флуда
         await asyncio.sleep(2)
 
     write_posts(ss, all_new_posts)
 
     if all_new_posts and tg_token and tg_chats:
-        log.info('Отправляю ' + str(len(all_new_posts)) + ' постов в TG...')
+        log.info(f'Отправляю {len(all_new_posts)} постов в TG...')
         send_to_telegram(all_new_posts, tg_token, tg_chats)
 
     summary = (
-        'ПРОГОН ЗАВЕРШЁН | чатов: ' + str(len(channels)) +
-        ' | новых: ' + str(total_new) +
-        ' | записано: ' + str(total_saved)
+        f'ПРОГОН ЗАВЕРШЁН | чатов: {len(channels)} | '
+        f'новых: {total_new} | записано: {total_saved}'
     )
     log.info(summary)
     write_log(ss, 'INFO', summary)
