@@ -1,0 +1,48 @@
+name: TG Parser
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # каждые 30 минут
+  workflow_dispatch:           # ручной запуск
+
+jobs:
+  parse:
+    # Каждый элемент matrix — отдельная конфигурация со своим Spreadsheet
+    # Добавь сколько нужно конфигураций, дай каждой понятное имя
+    strategy:
+      fail-fast: false          # если одна конфига упала — остальные продолжают
+      matrix:
+        config:
+          - name: "config-1"
+            spreadsheet_id_secret: SPREADSHEET_ID_1   # имя секрета в GitHub
+          - name: "config-2"
+            spreadsheet_id_secret: SPREADSHEET_ID_2
+          # - name: "config-3"
+          #   spreadsheet_id_secret: SPREADSHEET_ID_3
+
+    name: "Прогон [${{ matrix.config.name }}]"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run parser
+        env:
+          # Общие секреты для всех конфигураций
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          GOOGLE_CREDENTIALS_BASE64: ${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}
+          LOOKBACK_MINUTES: '35'
+          # SPREADSHEET_ID берётся из секрета, имя которого задано в matrix
+          SPREADSHEET_ID: ${{ secrets[matrix.config.spreadsheet_id_secret] }}
+        run: python main.py
