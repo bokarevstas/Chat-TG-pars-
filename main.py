@@ -20,15 +20,18 @@ from telethon.errors import (
 )
 from telethon.tl.types import InputPeerChannel
 
+# ══════════════════════════════════════════════════════
+#  Конфигурация из переменных окружения
+# ══════════════════════════════════════════════════════
+
 API_ID = int(os.environ.get('TG_API_ID', '0'))
 API_HASH = os.environ.get('TG_API_HASH', '')
 SESSION_STRING = os.environ.get('TG_SESSION', '')
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')       # уникален для каждой конфигурации
 GOOGLE_CREDENTIALS_BASE64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 LOOKBACK_MINUTES = int(os.environ.get('LOOKBACK_MINUTES', '35'))
 
-# Максимальное время ожидания FloodWait — если больше, канал пропускается
-MAX_FLOOD_WAIT_SEC = 300
+MAX_FLOOD_WAIT_SEC = 300  # FloodWait больше этого — канал пропускается
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +40,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Кеш entity в рамках одного прогона
 _entity_cache: dict = {}
 
 
@@ -47,30 +49,28 @@ _entity_cache: dict = {}
 
 def parse_channel_address(raw: str) -> dict:
     """
-    Поддерживаемые форматы:
+    Поддерживаемые форматы колонки A листа «Каналы»:
       @username
       username
       https://t.me/username
-      https://t.me/c/1924271762/3178   <- приватная супергруппа
-      -1001924271762                    <- числовой ID
+      https://t.me/c/1924271762/3178  ← приватная супергруппа
+      -1001924271762                   ← числовой ID
     """
     raw = raw.strip()
     if not raw:
         return {}
 
-    # Приватная супергруппа: t.me/c/<channel_id>/<msg_id>
     m = re.match(r'(?:https?://)?t\.me/c/(\d+)(?:/\d+)?', raw)
     if m:
         return {'type': 'private', 'username': None, 'channel_id': int(m.group(1))}
 
-    # Числовой ID напрямую
     if re.match(r'^-?\d+$', raw):
-        cid = int(raw)
-        if cid < 0:
-            cid = int(str(abs(cid)).lstrip('100') or str(abs(cid)))
+        cid = abs(int(raw))
+        s = str(cid)
+        if s.startswith('100'):
+            cid = int(s[3:])
         return {'type': 'private', 'username': None, 'channel_id': cid}
 
-    # Публичный: https://t.me/username или @username или просто username
     m = re.match(r'(?:https?://)?t\.me/([a-zA-Z0-9_]+)', raw)
     if m:
         return {'type': 'username', 'username': m.group(1), 'channel_id': None}
@@ -84,60 +84,6 @@ def parse_channel_address(raw: str) -> dict:
     return {}
 
 
-def extract_post_id(link: str) -> int:
-    m = re.search(r'/(\d+)$', link)
-    return int(m.group(1)) if m else 0
-
-
-def build_link(chat, msg_id: int) -> str:
-    username = getattr(chat, 'username', None)
-    if username:
-        return f'https://t.me/{username}/{msg_id}'
-    chat_id = str(chat.id)
-    if chat_id.startswith('-100'):
-        chat_id = chat_id[4:]
-    return f'https://t.me/c/{chat_id}/{msg_id}'
-
-
-def get_author_info(msg):
-    try:
-        if not msg.sender:
-            return '', ''
-        sender = msg.sender
-        first = getattr(sender, 'first_name', '') or ''
-        last = getattr(sender, 'last_name', '') or ''
-        username = getattr(sender, 'username', '') or ''
-        full_name = (first + ' ' + last).strip()
-        author_link = f'https://t.me/{username}' if username else ''
-        return full_name, author_link
-    except Exception:
-        return '', ''
-
-
-def matches_keywords(text: str, keywords: list) -> bool:
-    """Возвращает True если текст содержит хотя бы одно ключевое слово."""
-    if not text or not keywords:
-        return False
-    text_lower = text.lower()
-    for kw in keywords:
-        kw_lower = kw.lower().strip().rstrip('*')
-        if kw_lower and kw_lower in text_lower:
-            return True
-    return False
-
-
-def matches_negatives(text: str, negatives: list) -> bool:
-    """Возвращает True если текст содержит хотя бы одно негативное слово."""
-    if not text or not negatives:
-        return False
-    text_lower = text.lower()
-    for neg in negatives:
-        neg_lower = neg.lower().strip().rstrip('*')
-        if neg_lower and neg_lower in text_lower:
-            return True
-    return False
-
-
 # ══════════════════════════════════════════════════════
 #  Google Sheets
 # ══════════════════════════════════════════════════════
@@ -145,7 +91,7 @@ def matches_negatives(text: str, negatives: list) -> bool:
 def get_spreadsheet():
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
+        'https://www.googleapis.com/auth/drive',
     ]
     creds_json = json.loads(base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8'))
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
@@ -155,57 +101,57 @@ def get_spreadsheet():
 
 def get_settings(ss):
     """
-    Читает лист «Настройки»:
-      D = ключевые слова (строки 2+)
-      E = негативные слова (строки 2+)
-      F1 = чекбокс включения фильтра ключевых слов (TRUE/FALSE)
+    Лист «Настройки»:
+      A2  = «TG-бот»  B2 = токен бота
+      A3  = «Чаты»    B3 = метка (игнорируем)
+      A4+ = chat_id для отправки (B4+ — не используется)
+      D   = ключевые слова (строки 2+)
+      F   = негативные слова (строки 2+)
+      H1  = чекбокс включения фильтра (TRUE/FALSE)
+
+    Возвращает: keywords_enabled, keywords, negatives, tg_token, tg_chats
     """
     try:
         sheet = ss.worksheet('Настройки')
         data = sheet.get_all_values()
 
-        # F1 — чекбокс включения фильтра (колонка F = индекс 5)
-        keywords_enabled = str(data[0][5]).upper() == 'TRUE' if data and len(data[0]) > 5 else False
+        # H1 — чекбокс (индекс 7)
+        keywords_enabled = str(data[0][7]).upper() == 'TRUE' if data and len(data[0]) > 7 else False
+
+        # B2 — токен бота
+        tg_token = str(data[1][1]).strip() if len(data) > 1 and len(data[1]) > 1 else ''
+
+        # A4+ — chat_id для отправки (строка 3 = индекс 2, далее)
+        tg_chats = []
+        for row in data[3:]:
+            val = str(row[0]).strip() if row else ''
+            if val:
+                tg_chats.append(val)
 
         keywords = []
         negatives = []
-
         for row in data[1:]:
-            # Колонка D (индекс 3) — ключевые слова
+            # D (индекс 3) — ключевые слова
             if len(row) > 3 and row[3].strip():
                 keywords.append(row[3].strip())
-            # Колонка E (индекс 4) — негативные слова
-            if len(row) > 4 and row[4].strip():
-                negatives.append(row[4].strip())
+            # F (индекс 5) — негативные слова
+            if len(row) > 5 and row[5].strip():
+                negatives.append(row[5].strip())
 
-        return keywords_enabled, keywords, negatives
+        return keywords_enabled, keywords, negatives, tg_token, tg_chats
+
     except Exception as e:
         log.error('Ошибка чтения настроек: ' + str(e))
-        return False, [], []
-
-
-def get_tg_settings(ss):
-    try:
-        sheet = ss.worksheet('Настройки')
-        data = sheet.get_all_values()
-        token = str(data[1][1]).strip() if len(data) > 1 and len(data[1]) > 1 else ''
-        chats = []
-        for row in data[2:]:
-            if len(row) > 1 and str(row[1]).strip():
-                chats.append(str(row[1]).strip())
-        return token, chats
-    except Exception as e:
-        log.error('Ошибка чтения TG настроек: ' + str(e))
-        return '', []
+        return False, [], [], '', []
 
 
 def get_channels(ss):
     """
     Лист «Каналы»:
-      A = адрес (username / t.me/c/ID/...)
-      B = last_link
-      C = статус
-      D = peer_id     (заполняется автоматически)
+      A = адрес канала
+      B = last_link   (последний пост — обновляется скриптом)
+      C = статус      (обновляется скриптом)
+      D = peer_id     (числовой ID — кеш, заполняется автоматически)
       E = access_hash (заполняется автоматически)
     """
     try:
@@ -246,7 +192,6 @@ def update_channel(ss, row, last_link, status):
 
 
 def save_channel_ids(ss, row, peer_id: int, access_hash: int):
-    """Сохраняет peer_id → D и access_hash → E после первого резолва."""
     try:
         sheet = ss.worksheet('Каналы')
         sheet.update([[str(peer_id), str(access_hash)]], f'D{row}:E{row}')
@@ -265,7 +210,7 @@ def write_posts(ss, posts):
             p['author_name'],
             p['author_link'],
             p['link'],
-            p['text']
+            p['text'],
         ] for p in posts]
         sheet.append_rows(rows, value_input_option='USER_ENTERED')
         log.info('Записано постов: ' + str(len(rows)))
@@ -281,14 +226,14 @@ def write_log(ss, level, message):
             safe = "'" + safe
         sheet.append_row(
             [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, safe],
-            value_input_option='USER_ENTERED'
+            value_input_option='USER_ENTERED',
         )
     except Exception as e:
         log.error('Ошибка записи лога: ' + str(e))
 
 
 # ══════════════════════════════════════════════════════
-#  Telegram Bot отправка
+#  Отправка в Telegram бот
 # ══════════════════════════════════════════════════════
 
 def send_to_telegram(posts, tg_token, tg_chats):
@@ -314,7 +259,7 @@ def send_to_telegram(posts, tg_token, tg_chats):
                 data = json.dumps({
                     'chat_id': chat_id,
                     'text': body,
-                    'disable_web_page_preview': False
+                    'disable_web_page_preview': False,
                 }).encode('utf-8')
                 req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
                 urllib.request.urlopen(req, timeout=10)
@@ -322,6 +267,62 @@ def send_to_telegram(posts, tg_token, tg_chats):
             except Exception as e:
                 log.error(f'Ошибка отправки TG в {chat_id}: {e} | текст: {body[:200]}')
         time.sleep(0.3)
+
+
+# ══════════════════════════════════════════════════════
+#  Вспомогательные функции
+# ══════════════════════════════════════════════════════
+
+def extract_post_id(link: str) -> int:
+    m = re.search(r'/(\d+)$', link)
+    return int(m.group(1)) if m else 0
+
+
+def build_link(chat, msg_id: int) -> str:
+    username = getattr(chat, 'username', None)
+    if username:
+        return f'https://t.me/{username}/{msg_id}'
+    chat_id = str(chat.id)
+    if chat_id.startswith('-100'):
+        chat_id = chat_id[4:]
+    return f'https://t.me/c/{chat_id}/{msg_id}'
+
+
+def get_author_info(msg):
+    try:
+        if not msg.sender:
+            return '', ''
+        sender = msg.sender
+        first = getattr(sender, 'first_name', '') or ''
+        last = getattr(sender, 'last_name', '') or ''
+        username = getattr(sender, 'username', '') or ''
+        full_name = (first + ' ' + last).strip()
+        author_link = f'https://t.me/{username}' if username else ''
+        return full_name, author_link
+    except Exception:
+        return '', ''
+
+
+def matches_keywords(text: str, keywords: list) -> bool:
+    if not text or not keywords:
+        return False
+    text_lower = text.lower()
+    for kw in keywords:
+        kw_lower = kw.lower().strip().rstrip('*')
+        if kw_lower and kw_lower in text_lower:
+            return True
+    return False
+
+
+def matches_negatives(text: str, negatives: list) -> bool:
+    if not text or not negatives:
+        return False
+    text_lower = text.lower()
+    for neg in negatives:
+        neg_lower = neg.lower().strip().rstrip('*')
+        if neg_lower and neg_lower in text_lower:
+            return True
+    return False
 
 
 # ══════════════════════════════════════════════════════
@@ -355,18 +356,17 @@ async def resolve_with_flood_protection(client, identifier, label: str, max_retr
 async def get_chat_entity(client, ch: dict) -> tuple:
     """
     Возвращает (chat_entity, is_new).
-    Приоритет стратегий (от быстрого к медленному):
-      1. peer_id + access_hash → InputPeerChannel (0 запросов)
-      2. Приватный channel_id  → session cache
-      3. Публичный peer_id     → session cache
-      4. Публичный username    → ResolveUsernameRequest (1 раз, потом кеш)
+    Приоритет (от быстрого к медленному):
+      1. peer_id + access_hash → InputPeerChannel  (0 API запросов)
+      2. Приватный channel_id из адреса → session cache
+      3. Публичный peer_id сохранён → session cache
+      4. Публичный username → ResolveUsernameRequest (только первый раз)
     """
     addr = ch['addr']
     peer_id = ch['peer_id']
     access_hash = ch['access_hash']
     label = ch['raw']
 
-    # 1. Оба ID сохранены → прямой InputPeerChannel, ноль запросов
     if peer_id is not None and access_hash is not None:
         cache_key = f'input_{peer_id}'
         if cache_key not in _entity_cache:
@@ -375,7 +375,6 @@ async def get_chat_entity(client, ch: dict) -> tuple:
             _entity_cache[cache_key] = entity
         return _entity_cache[cache_key], False
 
-    # 2. Приватная супергруппа, channel_id из адреса
     if addr['type'] == 'private' and addr['channel_id'] is not None:
         try:
             entity = await resolve_with_flood_protection(client, addr['channel_id'], label)
@@ -386,12 +385,10 @@ async def get_chat_entity(client, ch: dict) -> tuple:
                 f'Убедитесь что аккаунт состоит в этом канале/группе.'
             )
 
-    # 3. Публичный, peer_id сохранён → session cache
     if peer_id is not None:
         entity = await resolve_with_flood_protection(client, peer_id, label)
         return entity, False
 
-    # 4. Публичный, первый запуск → резолв по username
     if addr['username']:
         entity = await resolve_with_flood_protection(client, addr['username'], label)
         return entity, True
@@ -404,7 +401,8 @@ async def get_chat_entity(client, ch: dict) -> tuple:
 # ══════════════════════════════════════════════════════
 
 async def main():
-    log.info('Запуск прогона...')
+    log.info(f'Запуск прогона | SPREADSHEET_ID: {SPREADSHEET_ID[:8]}...')
+
     try:
         ss = get_spreadsheet()
         log.info('Google Sheets подключён')
@@ -412,14 +410,14 @@ async def main():
         log.error('Ошибка Google Sheets: ' + str(e))
         return
 
-    keywords_enabled, keywords, negatives = get_settings(ss)
-    tg_token, tg_chats = get_tg_settings(ss)
+    keywords_enabled, keywords, negatives, tg_token, tg_chats = get_settings(ss)
     channels = get_channels(ss)
 
     log.info(
         f'Чатов: {len(channels)} | '
         f'Ключи: {"ВКЛ (" + str(len(keywords)) + " шт)" if keywords_enabled else "ВЫКЛ"} | '
-        f'Негативы: {len(negatives)} шт'
+        f'Негативы: {len(negatives)} шт | '
+        f'TG чатов для отправки: {len(tg_chats)}'
     )
 
     if not channels:
@@ -434,7 +432,7 @@ async def main():
     all_new_posts = []
     total_new = 0
     total_saved = 0
-    total_skipped_negative = 0
+    total_skipped_neg = 0
 
     write_log(ss, 'INFO',
         f'ПРОГОН НАЧАТ | чатов: {len(channels)} | '
@@ -449,7 +447,6 @@ async def main():
         row = ch['row']
 
         try:
-            # ── Получаем entity ───────────────────────────────────────────
             chat, is_new = await get_chat_entity(client, ch)
 
             if is_new:
@@ -459,7 +456,6 @@ async def main():
 
             chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or label
 
-            # ── Читаем сообщения ──────────────────────────────────────────
             since = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
             messages = []
 
@@ -479,7 +475,6 @@ async def main():
             new_last_link = last_link
 
             for msg in messages:
-                # Пропускаем системные сообщения
                 if msg.action is not None:
                     continue
 
@@ -493,18 +488,15 @@ async def main():
                 date = msg.date.replace(tzinfo=None)
                 new_last_link = link
 
-                # ── Фильтр ключевых слов ──────────────────────────────────
+                # Фильтр ключевых слов
                 if keywords_enabled and keywords:
                     if text.strip():
                         if not matches_keywords(text, keywords):
                             continue
                     else:
-                        # Пост без текста пропускаем если фильтр включён
                         continue
 
-                # ── Фильтр негативных слов ────────────────────────────────
-                # Работает независимо от keywords_enabled:
-                # если негативы заданы — проверяем всегда
+                # Фильтр негативных слов (работает всегда если заданы)
                 if negatives and text.strip():
                     if matches_negatives(text, negatives):
                         skipped_neg += 1
@@ -517,27 +509,25 @@ async def main():
                     'author_name': author_name,
                     'author_link': author_link,
                     'link': link,
-                    'text': text
+                    'text': text,
                 })
 
             total_new += new_msgs_count
             total_saved += len(saved_msgs)
-            total_skipped_negative += skipped_neg
+            total_skipped_neg += skipped_neg
             all_new_posts.extend(saved_msgs)
 
-            status_parts = []
             if new_msgs_count > 0:
-                status_parts.append(f'Новых: {new_msgs_count}')
-                status_parts.append(f'Записано: {len(saved_msgs)}')
+                status = f'✅ Новых: {new_msgs_count} | Записано: {len(saved_msgs)}'
                 if skipped_neg:
-                    status_parts.append(f'Негативов: {skipped_neg}')
-                update_channel(ss, row, new_last_link, '✅ ' + ' | '.join(status_parts))
+                    status += f' | Негативов: {skipped_neg}'
+                update_channel(ss, row, new_last_link, status)
             else:
                 update_channel(ss, row, last_link, '✅ Нет новых сообщений')
 
             log.info(
                 f'{label} | новых: {new_msgs_count} | записано: {len(saved_msgs)} | '
-                f'негативов: {skipped_neg} | lastId: {last_post_id if last_post_id else "пусто"}'
+                f'негативов: {skipped_neg} | lastId: {last_post_id or "пусто"}'
             )
 
         except FloodWaitError as e:
@@ -561,7 +551,7 @@ async def main():
     summary = (
         f'ПРОГОН ЗАВЕРШЁН | чатов: {len(channels)} | '
         f'новых: {total_new} | записано: {total_saved} | '
-        f'отклонено по негативам: {total_skipped_negative}'
+        f'негативов: {total_skipped_neg}'
     )
     log.info(summary)
     write_log(ss, 'INFO', summary)
